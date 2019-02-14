@@ -14,6 +14,7 @@
 package index
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"runtime"
 	"sort"
@@ -365,25 +366,131 @@ func Merge(its ...Postings) Postings {
 	if len(its) == 1 {
 		return its[0]
 	}
-	// All the uses of this function immediately expand it, so
-	// collect everything in a map. This is more efficient
-	// when there's 100ks of postings, compared to
-	// having a tree of merge objects.
-	pm := make(map[uint64]struct{}, len(its))
-	for _, it := range its {
-		for it.Next() {
-			pm[it.At()] = struct{}{}
-		}
-		if it.Err() != nil {
-			return ErrPostings(it.Err())
+	return newMergedPostings(its)
+}
+
+type PostingsHeap []Postings
+
+func (h PostingsHeap) Len() int           { return len(h) }
+func (h PostingsHeap) Less(i, j int) bool { return h[i].At() < h[j].At() }
+func (h *PostingsHeap) Swap(i, j int)     { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+
+func (h *PostingsHeap) Push(x interface{}) {
+	*h = append(*h, x.(Postings))
+}
+
+func (h *PostingsHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+type mergedPostings struct {
+	h          PostingsHeap
+	initilized bool
+	heaped     bool
+	cur        uint64
+	err        error
+}
+
+func newMergedPostings(p []Postings) *mergedPostings {
+	ph := make(PostingsHeap, 0, len(p))
+	for _, it := range p {
+		if it.Next() {
+			ph = append(ph, it)
+		} else {
+			if it.Err() != nil {
+				return &mergedPostings{err: it.Err()}
+			}
 		}
 	}
-	pl := make([]uint64, 0, len(pm))
-	for p := range pm {
-		pl = append(pl, p)
+	return &mergedPostings{h: ph}
+}
+
+func (it *mergedPostings) Next() bool {
+	if it.h.Len() == 0 || it.err != nil {
+		return false
 	}
-	sort.Slice(pl, func(i, j int) bool { return pl[i] < pl[j] })
-	return newListPostings(pl)
+
+	if !it.initilized {
+		it.cur = it.h[0].At()
+		it.initilized = true
+		return true
+	}
+	if !it.heaped {
+		heap.Init(&(it.h))
+		it.heaped = true
+	}
+
+	for {
+		cur := it.h[0]
+		if !cur.Next() {
+			heap.Pop(&(it.h))
+			if cur.Err() != nil {
+				it.err = cur.Err()
+				return false
+			}
+			if it.h.Len() == 0 {
+				return false
+			}
+		} else {
+			heap.Fix(&(it.h), 0)
+		}
+
+		cur = it.h[0]
+		if it.h[0].At() != it.cur {
+			it.cur = it.h[0].At()
+			return true
+		}
+	}
+}
+
+func (it *mergedPostings) Seek(id uint64) bool {
+	if it.h.Len() == 0 || it.err != nil {
+		return false
+	}
+	if !it.initilized {
+		if !it.Next() {
+			return false
+		}
+		it.initilized = true
+	}
+	if it.cur >= id {
+		return true
+	}
+	// Heapifying when there is lots of Seeks is inefficient.
+	it.heaped = false
+	newH := make(PostingsHeap, 0, len(it.h))
+	lowest := ^uint64(0)
+	for _, i := range it.h {
+		if i.Seek(id) {
+			newH = append(newH, i)
+			if i.At() < lowest {
+				lowest = i.At()
+			}
+		} else {
+			if i.Err() != nil {
+				it.err = i.Err()
+				return false
+			}
+		}
+	}
+	it.h = newH
+	if len(it.h) == 0 {
+		return false
+	}
+	it.cur = lowest
+	return true
+}
+
+func (it mergedPostings) At() uint64 {
+	return it.cur
+}
+
+func (it mergedPostings) Err() error {
+	return it.err
 }
 
 // Without returns a new postings list that contains all elements from the full list that
@@ -497,6 +604,9 @@ func (it *listPostings) Seek(x uint64) bool {
 	// If the current value satisfies, then return.
 	if it.cur >= x {
 		return true
+	}
+	if len(it.list) == 0 {
+		return false
 	}
 
 	// Do binary search between current position and end.
